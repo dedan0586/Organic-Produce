@@ -379,3 +379,69 @@
   (var-get platform-fee-percent)
 )
 
+
+
+(define-map subscriptions
+  { subscriber: principal, seller: principal }
+  {
+    start-block: uint,
+    duration-blocks: uint,
+    payment-amount: uint,
+    is-active: bool,
+    last-payment: uint
+  }
+)
+
+(define-public (create-subscription 
+    (seller principal)
+    (duration-blocks uint)
+    (payment-amount uint))
+    
+  (let ((current-block stacks-block-height))
+    (asserts! (> payment-amount u0) (err u200))
+    (asserts! (> duration-blocks u0) (err u201))
+    
+    (map-set subscriptions
+      { subscriber: tx-sender, seller: seller }
+      {
+        start-block: current-block,
+        duration-blocks: duration-blocks,
+        payment-amount: payment-amount,
+        is-active: true,
+        last-payment: current-block
+      }
+    )
+    
+    (try! (stx-transfer? payment-amount tx-sender seller))
+    (ok true))
+)
+
+(define-public (process-subscription-payment 
+    (subscriber principal)
+    (seller principal))
+    
+  (let (
+    (sub (unwrap! (map-get? subscriptions { subscriber: subscriber, seller: seller }) (err u202)))
+    (current-block stacks-block-height)
+    (next-payment (+ (get last-payment sub) (get duration-blocks sub)))
+  )
+    (asserts! (get is-active sub) (err u203))
+    (asserts! (>= current-block next-payment) (err u204))
+    
+    (try! (stx-transfer? (get payment-amount sub) subscriber seller))
+    
+    (map-set subscriptions
+      { subscriber: subscriber, seller: seller }
+      (merge sub { last-payment: current-block })
+    )
+    (ok true))
+)
+
+(define-public (cancel-subscription (seller principal))
+  (let ((sub (unwrap! (map-get? subscriptions { subscriber: tx-sender, seller: seller }) (err u202))))
+    (map-set subscriptions
+      { subscriber: tx-sender, seller: seller }
+      (merge sub { is-active: false })
+    )
+    (ok true))
+)
