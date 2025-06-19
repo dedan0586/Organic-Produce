@@ -445,3 +445,166 @@
     )
     (ok true))
 )
+
+
+(define-data-var next-tracking-id uint u1)
+
+(define-map supply-chain-events
+  { tracking-id: uint }
+  {
+    product-id: uint,
+    event-type: (string-ascii 20),
+    location: (string-ascii 100),
+    timestamp: uint,
+    handler: principal,
+    temperature: (optional uint),
+    notes: (optional (string-ascii 200)),
+    previous-tracking-id: (optional uint)
+  }
+)
+
+(define-map product-tracking
+  { product-id: uint }
+  {
+    current-tracking-id: (optional uint),
+    total-events: uint,
+    last-updated: uint
+  }
+)
+
+(define-map authorized-handlers
+  { handler: principal }
+  { is-authorized: bool }
+)
+
+(define-public (authorize-handler (handler principal))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) (err ERR-NOT-AUTHORIZED))
+    (map-set authorized-handlers
+      { handler: handler }
+      { is-authorized: true }
+    )
+    (ok true)
+  )
+)
+
+(define-public (revoke-handler (handler principal))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) (err ERR-NOT-AUTHORIZED))
+    (map-set authorized-handlers
+      { handler: handler }
+      { is-authorized: false }
+    )
+    (ok true)
+  )
+)
+
+(define-public (add-supply-chain-event
+    (product-id uint)
+    (event-type (string-ascii 20))
+    (location (string-ascii 100))
+    (temperature (optional uint))
+    (notes (optional (string-ascii 200))))
+  (let (
+    (product (unwrap! (map-get? products { product-id: product-id }) (err ERR-PRODUCT-NOT-FOUND)))
+    (tracking-id (var-get next-tracking-id))
+    (current-tracking (default-to 
+      { current-tracking-id: none, total-events: u0, last-updated: u0 }
+      (map-get? product-tracking { product-id: product-id })))
+    (handler-auth (default-to 
+      { is-authorized: false }
+      (map-get? authorized-handlers { handler: tx-sender })))
+  )
+    (asserts! (or 
+      (is-eq tx-sender (get seller product))
+      (is-eq tx-sender CONTRACT-OWNER)
+      (get is-authorized handler-auth)
+    ) (err ERR-NOT-AUTHORIZED))
+    
+    (map-insert supply-chain-events
+      { tracking-id: tracking-id }
+      {
+        product-id: product-id,
+        event-type: event-type,
+        location: location,
+        timestamp: stacks-block-height,
+        handler: tx-sender,
+        temperature: temperature,
+        notes: notes,
+        previous-tracking-id: (get current-tracking-id current-tracking)
+      }
+    )
+    
+    (map-set product-tracking
+      { product-id: product-id }
+      {
+        current-tracking-id: (some tracking-id),
+        total-events: (+ (get total-events current-tracking) u1),
+        last-updated: stacks-block-height
+      }
+    )
+    
+    (var-set next-tracking-id (+ tracking-id u1))
+    (ok tracking-id)
+  )
+)
+
+(define-read-only (get-supply-chain-event (tracking-id uint))
+  (map-get? supply-chain-events { tracking-id: tracking-id })
+)
+
+(define-read-only (get-product-tracking-summary (product-id uint))
+  (map-get? product-tracking { product-id: product-id })
+)
+
+(define-read-only (get-latest-tracking-event (product-id uint))
+  (let ((tracking-summary (map-get? product-tracking { product-id: product-id })))
+    (match tracking-summary
+      summary (match (get current-tracking-id summary)
+        tracking-id (map-get? supply-chain-events { tracking-id: tracking-id })
+        none
+      )
+      none
+    )
+  )
+)
+
+(define-read-only (is-handler-authorized (handler principal))
+  (let ((handler-data (map-get? authorized-handlers { handler: handler })))
+    (match handler-data
+      data (get is-authorized data)
+      false
+    )
+  )
+)
+
+;; (define-read-only (get-supply-chain-history (product-id uint) (max-events uint))
+;;   (let ((tracking-summary (map-get? product-tracking { product-id: product-id })))
+;;     (match tracking-summary
+;;       summary (get-chain-events-recursive 
+;;         (get current-tracking-id summary) 
+;;         max-events 
+;;         (list))
+;;       (list)
+;;     )
+;;   )
+;; )
+
+;; (define-private (get-chain-events-recursive 
+;;     (tracking-id (optional uint)) 
+;;     (remaining uint) 
+;;     (acc (list 10 uint)))
+;;   (if (or (is-none tracking-id) (is-eq remaining u0))
+;;     acc
+;;     (let ((current-id (unwrap-panic tracking-id)))
+;;       (match (map-get? supply-chain-events { tracking-id: current-id })
+;;         event (get-chain-events-recursive 
+;;           (get previous-tracking-id event)
+;;           (- remaining u1)
+;;           (unwrap-panic (as-max-len? (append acc current-id) u10))
+;;         )
+;;         acc
+;;       )
+;;     )
+;;   )
+;; )
