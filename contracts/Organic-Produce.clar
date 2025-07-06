@@ -578,33 +578,225 @@
   )
 )
 
-;; (define-read-only (get-supply-chain-history (product-id uint) (max-events uint))
-;;   (let ((tracking-summary (map-get? product-tracking { product-id: product-id })))
-;;     (match tracking-summary
-;;       summary (get-chain-events-recursive 
-;;         (get current-tracking-id summary) 
-;;         max-events 
-;;         (list))
-;;       (list)
-;;     )
-;;   )
-;; )
 
-;; (define-private (get-chain-events-recursive 
-;;     (tracking-id (optional uint)) 
-;;     (remaining uint) 
-;;     (acc (list 10 uint)))
-;;   (if (or (is-none tracking-id) (is-eq remaining u0))
-;;     acc
-;;     (let ((current-id (unwrap-panic tracking-id)))
-;;       (match (map-get? supply-chain-events { tracking-id: current-id })
-;;         event (get-chain-events-recursive 
-;;           (get previous-tracking-id event)
-;;           (- remaining u1)
-;;           (unwrap-panic (as-max-len? (append acc current-id) u10))
-;;         )
-;;         acc
-;;       )
-;;     )
-;;   )
-;; )
+(define-data-var next-season-id uint u1)
+
+(define-map seasonal-produce-types
+  { season-id: uint }
+  {
+    name: (string-ascii 50),
+    season-start-month: uint,
+    season-end-month: uint,
+    typical-harvest-duration: uint,
+    created-by: principal
+  }
+)
+
+(define-map seasonal-interest
+  { season-id: uint, buyer: principal }
+  {
+    max-price: uint,
+    desired-quantity: uint,
+    registered-at: uint,
+    is-active: bool
+  }
+)
+
+(define-map seasonal-demand-summary
+  { season-id: uint }
+  {
+    total-interested-buyers: uint,
+    total-demand-quantity: uint,
+    average-max-price: uint,
+    last-updated: uint
+  }
+)
+
+(define-map seasonal-pre-orders
+  { season-id: uint, buyer: principal, farmer: principal }
+  {
+    quantity: uint,
+    agreed-price: uint,
+    delivery-month: uint,
+    status: (string-ascii 20),
+    created-at: uint
+  }
+)
+
+(define-public (register-seasonal-produce
+    (name (string-ascii 50))
+    (season-start-month uint)
+    (season-end-month uint)
+    (typical-harvest-duration uint))
+  (let ((season-id (var-get next-season-id)))
+    (asserts! (and (<= season-start-month u12) (>= season-start-month u1)) (err u300))
+    (asserts! (and (<= season-end-month u12) (>= season-end-month u1)) (err u301))
+    (asserts! (> typical-harvest-duration u0) (err u302))
+    
+    (map-insert seasonal-produce-types
+      { season-id: season-id }
+      {
+        name: name,
+        season-start-month: season-start-month,
+        season-end-month: season-end-month,
+        typical-harvest-duration: typical-harvest-duration,
+        created-by: tx-sender
+      }
+    )
+    
+    (map-insert seasonal-demand-summary
+      { season-id: season-id }
+      {
+        total-interested-buyers: u0,
+        total-demand-quantity: u0,
+        average-max-price: u0,
+        last-updated: stacks-block-height
+      }
+    )
+    
+    (var-set next-season-id (+ season-id u1))
+    (ok season-id)
+  )
+)
+
+(define-public (register-seasonal-interest
+    (season-id uint)
+    (max-price uint)
+    (desired-quantity uint))
+  (let (
+    (season-type (unwrap! (map-get? seasonal-produce-types { season-id: season-id }) (err u303)))
+    (current-summary (unwrap! (map-get? seasonal-demand-summary { season-id: season-id }) (err u304)))
+    (existing-interest (map-get? seasonal-interest { season-id: season-id, buyer: tx-sender }))
+  )
+    (asserts! (> max-price u0) (err u305))
+    (asserts! (> desired-quantity u0) (err u306))
+    
+    (if (is-some existing-interest)
+      (begin
+        (map-set seasonal-interest
+          { season-id: season-id, buyer: tx-sender }
+          {
+            max-price: max-price,
+            desired-quantity: desired-quantity,
+            registered-at: stacks-block-height,
+            is-active: true
+          }
+        )
+        (ok true)
+      )
+      (begin
+        (map-insert seasonal-interest
+          { season-id: season-id, buyer: tx-sender }
+          {
+            max-price: max-price,
+            desired-quantity: desired-quantity,
+            registered-at: stacks-block-height,
+            is-active: true
+          }
+        )
+        
+        (let (
+          (new-total-buyers (+ (get total-interested-buyers current-summary) u1))
+          (new-total-quantity (+ (get total-demand-quantity current-summary) desired-quantity))
+          (new-price-sum (+ (* (get average-max-price current-summary) (get total-interested-buyers current-summary)) max-price))
+          (new-average-price (if (> new-total-buyers u0) (/ new-price-sum new-total-buyers) u0))
+        )
+          (map-set seasonal-demand-summary
+            { season-id: season-id }
+            {
+              total-interested-buyers: new-total-buyers,
+              total-demand-quantity: new-total-quantity,
+              average-max-price: new-average-price,
+              last-updated: stacks-block-height
+            }
+          )
+        )
+        (ok true)
+      )
+    )
+  )
+)
+
+(define-public (create-seasonal-pre-order
+    (season-id uint)
+    (buyer principal)
+    (quantity uint)
+    (agreed-price uint)
+    (delivery-month uint))
+  (let (
+    (season-type (unwrap! (map-get? seasonal-produce-types { season-id: season-id }) (err u303)))
+    (buyer-interest (unwrap! (map-get? seasonal-interest { season-id: season-id, buyer: buyer }) (err u307)))
+  )
+    (asserts! (> quantity u0) (err u308))
+    (asserts! (> agreed-price u0) (err u309))
+    (asserts! (and (<= delivery-month u12) (>= delivery-month u1)) (err u310))
+    (asserts! (<= agreed-price (get max-price buyer-interest)) (err u311))
+    (asserts! (<= quantity (get desired-quantity buyer-interest)) (err u312))
+    
+    (map-insert seasonal-pre-orders
+      { season-id: season-id, buyer: buyer, farmer: tx-sender }
+      {
+        quantity: quantity,
+        agreed-price: agreed-price,
+        delivery-month: delivery-month,
+        status: "confirmed",
+        created-at: stacks-block-height
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (cancel-seasonal-interest (season-id uint))
+  (let (
+    (interest (unwrap! (map-get? seasonal-interest { season-id: season-id, buyer: tx-sender }) (err u307)))
+    (current-summary (unwrap! (map-get? seasonal-demand-summary { season-id: season-id }) (err u304)))
+  )
+    (map-set seasonal-interest
+      { season-id: season-id, buyer: tx-sender }
+      (merge interest { is-active: false })
+    )
+    
+    (let (
+      (new-total-buyers (- (get total-interested-buyers current-summary) u1))
+      (new-total-quantity (- (get total-demand-quantity current-summary) (get desired-quantity interest)))
+    )
+      (map-set seasonal-demand-summary
+        { season-id: season-id }
+        {
+          total-interested-buyers: new-total-buyers,
+          total-demand-quantity: new-total-quantity,
+          average-max-price: (get average-max-price current-summary),
+          last-updated: stacks-block-height
+        }
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-seasonal-produce-type (season-id uint))
+  (map-get? seasonal-produce-types { season-id: season-id })
+)
+
+(define-read-only (get-seasonal-demand-summary (season-id uint))
+  (map-get? seasonal-demand-summary { season-id: season-id })
+)
+
+(define-read-only (get-seasonal-interest (season-id uint) (buyer principal))
+  (map-get? seasonal-interest { season-id: season-id, buyer: buyer })
+)
+
+(define-read-only (get-seasonal-pre-order (season-id uint) (buyer principal) (farmer principal))
+  (map-get? seasonal-pre-orders { season-id: season-id, buyer: buyer, farmer: farmer })
+)
+
+(define-read-only (calculate-demand-score (season-id uint))
+  (let ((summary (map-get? seasonal-demand-summary { season-id: season-id })))
+    (match summary
+      data (+ (* (get total-interested-buyers data) u10) (/ (get total-demand-quantity data) u10))
+      u0
+    )
+  )
+)
