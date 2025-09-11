@@ -578,6 +578,317 @@
   )
 )
 
+;; ----- Harvest Prediction and Yield Insurance Features -----
+
+;; Yield Insurance error constants
+(define-constant ERR-PREDICTION-NOT-FOUND (err u500))
+(define-constant ERR-PREDICTION-EXISTS (err u501))
+(define-constant ERR-INSURANCE-POOL-NOT-FOUND (err u502))
+(define-constant ERR-INSURANCE-POOL-EXISTS (err u503))
+(define-constant ERR-INVALID-PREDICTION (err u504))
+(define-constant ERR-PREDICTION-EXPIRED (err u505))
+(define-constant ERR-INSUFFICIENT-INSURANCE-FUNDS (err u506))
+(define-constant ERR-YIELD-ALREADY-REPORTED (err u507))
+(define-constant ERR-INSURANCE-ALREADY-PARTICIPATED (err u508))
+(define-constant ERR-INSURANCE-POOL-CLOSED (err u509))
+
+;; Yield Insurance data variables
+(define-data-var next-prediction-id uint u1)
+(define-data-var next-insurance-pool-id uint u1)
+
+;; Yield predictions by farmers
+(define-map yield-predictions
+  { prediction-id: uint }
+  {
+    farmer: principal,
+    crop-type: (string-ascii 50),
+    predicted-yield: uint,
+    actual-yield: (optional uint),
+    prediction-deadline: uint,
+    harvest-deadline: uint,
+    confidence-level: uint, ;; 1-100 percentage
+    farm-size-hectares: uint,
+    created-at: uint,
+    yield-reported: bool
+  }
+)
+
+;; Insurance pools for yield protection
+(define-map insurance-pools
+  { pool-id: uint }
+  {
+    prediction-id: uint,
+    farmer: principal,
+    total-coverage: uint,
+    premium-rate: uint, ;; percentage
+    pool-funds: uint,
+    participants-count: uint,
+    is-active: bool,
+    payout-processed: bool,
+    created-at: uint
+  }
+)
+
+;; Insurance participation tracking
+(define-map insurance-participants
+  { pool-id: uint, participant: principal }
+  {
+    contribution: uint,
+    expected-return: uint,
+    payout-received: uint,
+    participation-date: uint
+  }
+)
+
+;; Register a yield prediction
+(define-public (register-yield-prediction
+    (crop-type (string-ascii 50))
+    (predicted-yield uint)
+    (prediction-deadline uint)
+    (harvest-deadline uint)
+    (confidence-level uint)
+    (farm-size-hectares uint))
+  (let ((prediction-id (var-get next-prediction-id)))
+    ;; Validate inputs
+    (asserts! (> predicted-yield u0) ERR-INVALID-PREDICTION)
+    (asserts! (and (>= confidence-level u1) (<= confidence-level u100)) ERR-INVALID-PREDICTION)
+    (asserts! (> farm-size-hectares u0) ERR-INVALID-PREDICTION)
+    (asserts! (> prediction-deadline stacks-block-height) ERR-INVALID-PREDICTION)
+    (asserts! (> harvest-deadline prediction-deadline) ERR-INVALID-PREDICTION)
+    
+    ;; Create yield prediction
+    (map-insert yield-predictions
+      { prediction-id: prediction-id }
+      {
+        farmer: tx-sender,
+        crop-type: crop-type,
+        predicted-yield: predicted-yield,
+        actual-yield: none,
+        prediction-deadline: prediction-deadline,
+        harvest-deadline: harvest-deadline,
+        confidence-level: confidence-level,
+        farm-size-hectares: farm-size-hectares,
+        created-at: stacks-block-height,
+        yield-reported: false
+      }
+    )
+    
+    (var-set next-prediction-id (+ prediction-id u1))
+    (ok prediction-id)
+  )
+)
+
+;; Create insurance pool for a yield prediction
+(define-public (create-insurance-pool
+    (prediction-id uint)
+    (total-coverage uint)
+    (premium-rate uint))
+  (let (
+    (prediction (unwrap! (map-get? yield-predictions { prediction-id: prediction-id }) ERR-PREDICTION-NOT-FOUND))
+    (pool-id (var-get next-insurance-pool-id))
+  )
+    ;; Only the farmer can create insurance pool for their prediction
+    (asserts! (is-eq tx-sender (get farmer prediction)) ERR-NOT-AUTHORIZED)
+    ;; Check if prediction is still valid
+    (asserts! (> (get prediction-deadline prediction) stacks-block-height) ERR-PREDICTION-EXPIRED)
+    ;; Validate inputs
+    (asserts! (> total-coverage u0) ERR-INVALID-PREDICTION)
+    (asserts! (and (>= premium-rate u1) (<= premium-rate u50)) ERR-INVALID-PREDICTION) ;; Max 50% premium rate
+    
+    ;; Create insurance pool
+    (map-insert insurance-pools
+      { pool-id: pool-id }
+      {
+        prediction-id: prediction-id,
+        farmer: tx-sender,
+        total-coverage: total-coverage,
+        premium-rate: premium-rate,
+        pool-funds: u0,
+        participants-count: u0,
+        is-active: true,
+        payout-processed: false,
+        created-at: stacks-block-height
+      }
+    )
+    
+    (var-set next-insurance-pool-id (+ pool-id u1))
+    (ok pool-id)
+  )
+)
+
+;; Participate in yield insurance pool
+(define-public (participate-in-insurance
+    (pool-id uint)
+    (contribution uint))
+  (let (
+    (pool (unwrap! (map-get? insurance-pools { pool-id: pool-id }) ERR-INSURANCE-POOL-NOT-FOUND))
+    (prediction (unwrap! (map-get? yield-predictions { prediction-id: (get prediction-id pool) }) ERR-PREDICTION-NOT-FOUND))
+    (expected-return (/ (* contribution (+ u100 (get premium-rate pool))) u100))
+  )
+    ;; Check if pool is active and not expired
+    (asserts! (get is-active pool) ERR-INSURANCE-POOL-CLOSED)
+    (asserts! (> (get prediction-deadline prediction) stacks-block-height) ERR-PREDICTION-EXPIRED)
+    ;; Check if user already participated
+    (asserts! (is-none (map-get? insurance-participants { pool-id: pool-id, participant: tx-sender })) ERR-INSURANCE-ALREADY-PARTICIPATED)
+    ;; Check sufficient funds
+    (asserts! (>= (stx-get-balance tx-sender) contribution) ERR-INSUFFICIENT-FUNDS)
+    
+    ;; Transfer contribution to contract
+    (try! (stx-transfer? contribution tx-sender (as-contract tx-sender)))
+    
+    ;; Record participation
+    (map-insert insurance-participants
+      { pool-id: pool-id, participant: tx-sender }
+      {
+        contribution: contribution,
+        expected-return: expected-return,
+        payout-received: u0,
+        participation-date: stacks-block-height
+      }
+    )
+    
+    ;; Update pool
+    (map-set insurance-pools
+      { pool-id: pool-id }
+      (merge pool {
+        pool-funds: (+ (get pool-funds pool) contribution),
+        participants-count: (+ (get participants-count pool) u1)
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Report actual yield (only farmer)
+(define-public (report-actual-yield
+    (prediction-id uint)
+    (actual-yield uint))
+  (let ((prediction (unwrap! (map-get? yield-predictions { prediction-id: prediction-id }) ERR-PREDICTION-NOT-FOUND)))
+    ;; Only the farmer can report yield
+    (asserts! (is-eq tx-sender (get farmer prediction)) ERR-NOT-AUTHORIZED)
+    ;; Check if yield not already reported
+    (asserts! (not (get yield-reported prediction)) ERR-YIELD-ALREADY-REPORTED)
+    ;; Check if within reporting window
+    (asserts! (<= stacks-block-height (get harvest-deadline prediction)) ERR-PREDICTION-EXPIRED)
+    
+    ;; Update prediction with actual yield
+    (map-set yield-predictions
+      { prediction-id: prediction-id }
+      (merge prediction {
+        actual-yield: (some actual-yield),
+        yield-reported: true
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Process insurance payout based on yield variance
+(define-public (process-insurance-payout (pool-id uint))
+  (let (
+    (pool (unwrap! (map-get? insurance-pools { pool-id: pool-id }) ERR-INSURANCE-POOL-NOT-FOUND))
+    (prediction (unwrap! (map-get? yield-predictions { prediction-id: (get prediction-id pool) }) ERR-PREDICTION-NOT-FOUND))
+    (actual-yield-val (unwrap! (get actual-yield prediction) ERR-YIELD-ALREADY-REPORTED))
+    (predicted-yield (get predicted-yield prediction))
+    (variance-percent (if (>= actual-yield-val predicted-yield)
+      u0
+      (/ (* (- predicted-yield actual-yield-val) u100) predicted-yield)))
+  )
+    ;; Only process if yield has been reported and not already processed
+    (asserts! (get yield-reported prediction) ERR-YIELD-ALREADY-REPORTED)
+    (asserts! (not (get payout-processed pool)) ERR-YIELD-ALREADY-REPORTED)
+    (asserts! (> (get harvest-deadline prediction) stacks-block-height) ERR-PREDICTION-EXPIRED)
+    
+    ;; Mark payout as processed
+    (map-set insurance-pools
+      { pool-id: pool-id }
+      (merge pool { payout-processed: true })
+    )
+    
+    ;; If yield loss > 20%, trigger insurance payout
+    (if (> variance-percent u20)
+      (let ((payout-amount (/ (* (get pool-funds pool) variance-percent) u100)))
+        ;; Pay farmer from insurance pool
+        (try! (as-contract (stx-transfer? payout-amount tx-sender (get farmer pool))))
+        (ok { payout: payout-amount, variance: variance-percent })
+      )
+      ;; No significant loss, return funds to participants
+      (ok { payout: u0, variance: variance-percent })
+    )
+  )
+)
+
+;; Claim insurance participation return
+(define-public (claim-insurance-return (pool-id uint))
+  (let (
+    (pool (unwrap! (map-get? insurance-pools { pool-id: pool-id }) ERR-INSURANCE-POOL-NOT-FOUND))
+    (participation (unwrap! (map-get? insurance-participants { pool-id: pool-id, participant: tx-sender }) ERR-INSURANCE-POOL-NOT-FOUND))
+    (prediction (unwrap! (map-get? yield-predictions { prediction-id: (get prediction-id pool) }) ERR-PREDICTION-NOT-FOUND))
+  )
+    ;; Check if payout has been processed
+    (asserts! (get payout-processed pool) ERR-YIELD-ALREADY-REPORTED)
+    ;; Check if user hasn't already claimed
+    (asserts! (is-eq (get payout-received participation) u0) ERR-YIELD-ALREADY-REPORTED)
+    
+    ;; Calculate return based on pool performance
+    (let (
+      (return-amount (if (and 
+          (is-some (get actual-yield prediction))
+          (>= (unwrap-panic (get actual-yield prediction)) (/ (* (get predicted-yield prediction) u80) u100)))
+        (get expected-return participation) ;; Full return if yield >= 80% of prediction
+        (/ (get contribution participation) u2) ;; 50% return for poor yield
+      ))
+    )
+      ;; Transfer return to participant
+      (try! (as-contract (stx-transfer? return-amount tx-sender (get farmer pool))))
+      
+      ;; Update participation record
+      (map-set insurance-participants
+        { pool-id: pool-id, participant: tx-sender }
+        (merge participation {
+          payout-received: return-amount
+        })
+      )
+      
+      (ok return-amount)
+    )
+  )
+)
+
+;; Read-only functions for yield insurance
+(define-read-only (get-yield-prediction (prediction-id uint))
+  (map-get? yield-predictions { prediction-id: prediction-id })
+)
+
+(define-read-only (get-insurance-pool (pool-id uint))
+  (map-get? insurance-pools { pool-id: pool-id })
+)
+
+(define-read-only (get-insurance-participation (pool-id uint) (participant principal))
+  (map-get? insurance-participants { pool-id: pool-id, participant: participant })
+)
+
+(define-read-only (calculate-yield-variance (prediction-id uint))
+  (let ((prediction (map-get? yield-predictions { prediction-id: prediction-id })))
+    (match prediction
+      pred (match (get actual-yield pred)
+        actual (let (
+          (predicted (get predicted-yield pred))
+          (variance (if (>= actual predicted)
+            u0
+            (/ (* (- predicted actual) u100) predicted)))
+        )
+          (some { predicted: predicted, actual: actual, variance-percent: variance })
+        )
+        none
+      )
+      none
+    )
+  )
+)
+
 ;; ----- CSA (Community-Supported Agriculture) Features -----
 
 ;; CSA error constants
